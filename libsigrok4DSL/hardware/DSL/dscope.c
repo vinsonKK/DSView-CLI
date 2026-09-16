@@ -1901,6 +1901,13 @@ static void remove_sources(struct DSL_context *devc)
 {
     int i;
     sr_info("%s: remove fds from polling", __func__);
+
+    if (devc->usbfd == NULL) {
+        /* Dummy-source fallback: single source registered with fd -1. */
+        sr_source_remove(-1);
+        return;
+    }
+
     /* Remove fds from polling. */
     for (i = 0; devc->usbfd[i] != -1; i++)
         sr_source_remove(devc->usbfd[i]);
@@ -2089,21 +2096,33 @@ static int dev_acquisition_start(struct sr_dev_inst *sdi, void *cb_data)
 
     /* setup callback function for data transfer */
     lupfd = libusb_get_pollfds(drvc->sr_ctx->libusb_ctx);
-    for (i = 0; lupfd[i]; i++);
 
-    if (!(devc->usbfd = g_try_malloc0(sizeof(struct libusb_pollfd) * (i + 1)))){
-        sr_err("%s,ERROR:failed to alloc memory.", __func__);
-    	return SR_ERR;
+    if (lupfd == NULL) {
+        /* Same Windows fallback as in dslogic.c: libusb_get_pollfds()
+         * returns NULL on platforms without a poll() API, and the loop
+         * below would dereference it.  A dummy source (fd -1) makes the
+         * session freewheel over receive_data(), which drives libusb
+         * event handling on its own. */
+        sr_info("%s: libusb pollfds unavailable, using dummy source", __func__);
+        devc->usbfd = NULL;
+        sr_source_add(-1, 0, dsl_get_timeout(sdi), receive_data, sdi);
+    } else {
+        for (i = 0; lupfd[i]; i++);
+
+        if (!(devc->usbfd = g_try_malloc0(sizeof(struct libusb_pollfd) * (i + 1)))){
+            sr_err("%s,ERROR:failed to alloc memory.", __func__);
+            return SR_ERR;
+        }
+
+        for (i = 0; lupfd[i]; i++) {
+            sr_source_add(lupfd[i]->fd, lupfd[i]->events,
+                      dsl_get_timeout(sdi), receive_data, sdi);
+            devc->usbfd[i] = lupfd[i]->fd;
+        }
+
+        devc->usbfd[i] = -1;
+        g_free(lupfd);
     }
-
-    for (i = 0; lupfd[i]; i++) {
-        sr_source_add(lupfd[i]->fd, lupfd[i]->events,
-                  dsl_get_timeout(sdi), receive_data, sdi);
-        devc->usbfd[i] = lupfd[i]->fd;
-    }
-
-    devc->usbfd[i] = -1;
-    g_free(lupfd);
 
     wr_cmd.header.dest = DSL_CTL_START;
     wr_cmd.header.size = 0;
